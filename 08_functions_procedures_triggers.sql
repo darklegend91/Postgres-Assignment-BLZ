@@ -1,14 +1,14 @@
  select * from shipments
 
 -- =========================================================
--- STEP 0: Add column for risk classification
+-- Add column for risk classification
 -- =========================================================
 ALTER TABLE shipments
 ADD COLUMN IF NOT EXISTS risk_classification TEXT DEFAULT 'UNKNOWN';
 
 
 -- =========================================================
--- A. FUNCTION — Risk Classification
+-- FUNCTION — Risk Classification
 -- =========================================================
 CREATE OR REPLACE FUNCTION fn_classify_risk(
     p_route_risk        NUMERIC,
@@ -100,9 +100,12 @@ LIMIT 15;
 
 
 -- =========================================================
--- C. STORED PROCEDURE — Update Risk Classification
+-- STORED PROCEDURE — Update Risk Classification
 -- =========================================================
-CREATE OR REPLACE PROCEDURE sp_update_risk_classification(p_shipment_id TEXT)
+CREATE OR REPLACE PROCEDURE sp_update_risk_classification(
+    IN  p_shipment_id TEXT,
+    OUT p_new_class   TEXT
+)
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -110,54 +113,62 @@ DECLARE
     v_delay_prob      NUMERIC;
     v_current_delay   INTEGER;
     v_inventory_days  INTEGER;
-    v_new_class       TEXT;
+    v_old_class       TEXT; -- Added: To remember what the class was BEFORE the update
 BEGIN
+    -- 1. Fetch the data, including the existing risk classification
     SELECT 
         sr.route_risk_score,
         sr.delay_probability,
         s.current_delay_days,
-        inv.inventory_days
-    INTO v_route_risk, v_delay_prob, v_current_delay, v_inventory_days
+        inv.inventory_days,
+        s.risk_classification
+    INTO 
+        v_route_risk, 
+        v_delay_prob, 
+        v_current_delay, 
+        v_inventory_days,
+        v_old_class
     FROM shipments s
     JOIN shipment_risk sr ON s.shipment_id = sr.shipment_id
     JOIN inventory inv   ON s.supplier_id = inv.supplier_id
                         AND s.product_type = inv.product_type
     WHERE s.shipment_id = p_shipment_id;
 
+    -- 2. Guard clause if shipment doesn't exist
     IF NOT FOUND THEN
         RAISE EXCEPTION 'Shipment % not found', p_shipment_id;
     END IF;
 
-    v_new_class := fn_classify_risk(v_route_risk, v_delay_prob,
-                                    v_current_delay, v_inventory_days);
+    p_new_class := fn_classify_risk(v_route_risk, v_delay_prob, v_current_delay, v_inventory_days);
 
-    UPDATE shipments
-    SET risk_classification = v_new_class
-    WHERE shipment_id = p_shipment_id;
+    IF v_old_class IS DISTINCT FROM p_new_class THEN
+        UPDATE shipments
+        SET risk_classification = p_new_class
+        WHERE shipment_id = p_shipment_id;
 
-    RAISE NOTICE 'Shipment % classified as %', p_shipment_id, v_new_class;
+        RAISE NOTICE 'Shipment % upgraded: % ➔ %', p_shipment_id, COALESCE(v_old_class, 'None'), p_new_class;
+    ELSE
+        RAISE NOTICE 'Shipment % unchanged (remains %)', p_shipment_id, p_new_class;
+    END IF;
+
+EXCEPTION
+    WHEN OTHERS THEN
+        ROLLBACK;
+        RAISE NOTICE 'Failed to update risk for %: %', p_shipment_id, SQLERRM;
 END;
 $$;
 
--- Call C:
-CALL sp_update_risk_classification('SHP0001');
-CALL sp_update_risk_classification('SHP0002');
+-- Call the procedure:
+CALL sp_update_risk_classification('SHP0001', NULL);
+CALL sp_update_risk_classification('SHP0002', NULL);
 
-SELECT shipment_id, risk_classification FROM shipments WHERE shipment_id IN ('SHP0001','SHP0002');
-
--- Bulk call for all shipments:
-DO $$
-DECLARE
-    r RECORD;
-BEGIN
-    FOR r IN SELECT shipment_id FROM shipments LOOP
-        CALL sp_update_risk_classification(r.shipment_id);
-    END LOOP;
-END $$;
-
+-- Verify the changes
+SELECT shipment_id, risk_classification 
+FROM shipments 
+WHERE shipment_id IN ('SHP0001','SHP0002');
 
 -- =========================================================
--- D. TRIGGER — Audit Table
+-- TRIGGER — Audit Table
 -- =========================================================
 CREATE TABLE IF NOT EXISTS shipment_audit (
     audit_id       SERIAL PRIMARY KEY,
@@ -204,12 +215,12 @@ FOR EACH ROW
 EXECUTE FUNCTION fn_audit_shipment_changes();
 
 -- Test D:
-UPDATE shipments SET current_delay_days = 99 WHERE shipment_id = 'SHP0001';
+UPDATE shipments SET current_delay_days = 100 WHERE shipment_id = 'SHP0001';
 SELECT * FROM shipment_audit ORDER BY changed_at DESC LIMIT 5;
 
 
 -- =========================================================
--- E. VALIDATION TRIGGER — Reject invalid data
+-- VALIDATION TRIGGER — Reject invalid data
 -- =========================================================
 CREATE OR REPLACE FUNCTION fn_validate_shipment()
 RETURNS TRIGGER
@@ -262,12 +273,3 @@ EXECUTE FUNCTION fn_validate_shipment_risk();
 
 -- Test E (should FAIL):
 UPDATE shipments SET freight_cost_usd = -999 WHERE shipment_id = 'SHP0002';
-
-
--- =========================================================
--- FINAL END-TO-END TEST
--- =========================================================
-CALL sp_update_risk_classification('SHP0002');
-SELECT shipment_id, risk_classification, current_delay_days FROM shipments WHERE shipment_id = 'SHP0002';
-UPDATE shipments SET current_delay_days = 50 WHERE shipment_id = 'SHP0002';
-SELECT * FROM shipment_audit WHERE shipment_id = 'SHP0002';
